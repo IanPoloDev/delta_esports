@@ -1,0 +1,2 @@
+import {serverDB} from '@/lib/supabase/server';
+export async function GET(request:Request){const url=new URL(request.url),code=url.searchParams.get('code');const db=await serverDB();if(code&&db){const {error}=await db.auth.exchangeCodeForSession(code);if(!error)return Response.redirect(new URL('/actualizar-contrasena',url.origin),303);}return Response.redirect(new URL('/login?access=invalid',url.origin),303);}

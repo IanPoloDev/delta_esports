@@ -1,0 +1,32 @@
+import {test,before,after} from 'node:test';
+import assert from 'node:assert/strict';
+import {PGlite} from '@electric-sql/pglite';
+import {readFile} from 'node:fs/promises';
+let db;
+const admin='00000000-0000-4000-8000-000000000001',organizer='00000000-0000-4000-8000-000000000002',referee='00000000-0000-4000-8000-000000000003',stranger='00000000-0000-4000-8000-000000000004';
+const event='10000000-0000-4000-8000-000000000001',hidden='10000000-0000-4000-8000-000000000002',tournament='20000000-0000-4000-8000-000000000001',privateT='20000000-0000-4000-8000-000000000002',player='30000000-0000-4000-8000-000000000001';
+async function as(role,user,sql){await db.exec('reset role');await db.query("select set_config('request.jwt.claim.sub',$1,false)",[user||'']);await db.exec(`set role ${role}`);return db.query(sql);}
+before(async()=>{
+ db=new PGlite();
+ await db.exec(`create schema auth;create table auth.users(id uuid primary key);create role anon;create role authenticated;grant usage on schema public,auth to anon,authenticated;create function auth.uid() returns uuid language sql stable as $$select nullif(current_setting('request.jwt.claim.sub',true),'')::uuid$$;grant execute on function auth.uid() to anon,authenticated;`);
+ let schema=await readFile('supabase/migrations/202611110001_foundation.sql','utf8');
+ // Embedded PostgreSQL does not offer Supabase's publication or pgcrypto extension.
+ schema=schema.replace('create extension if not exists pgcrypto;','').replace(/alter publication supabase_realtime add table[^;]+;/,'');
+ await db.exec(schema);
+ await db.exec(`insert into auth.users values('${admin}'),('${organizer}'),('${referee}'),('${stranger}');insert into public.platform_admins values('${admin}');insert into public.events(id,slug,name,is_public,state) values('${event}','public-event','Public event',true,'upcoming'),('${hidden}','hidden-event','Hidden event',false,'draft');insert into public.event_memberships values('${event}','${organizer}','organizer');insert into public.tournaments(id,event_id,slug,name,game,is_public,state) values('${tournament}','${event}','smash-ultimate','Smash Ultimate','smash',true,'upcoming'),('${privateT}','${hidden}','hidden-tournament','Hidden tournament','mk',false,'draft');insert into public.tournament_memberships values('${tournament}','${referee}','referee');insert into public.participants(id,event_id,gamer_tag) values('${player}','${event}','Nova');insert into public.participant_contacts(participant_id,email) values('${player}','private@example.test');insert into public.registrations(tournament_id,participant_id,state) values('${tournament}','${player}','approved');`);
+});
+after(async()=>{await db.close()});
+test('Anonymous visitor sees only published events and tournaments',async()=>{const r=await as('anon',null,'select * from public.events');assert.equal(r.rows.length,1);assert.equal(r.rows[0].id,event);assert.equal((await db.query('select * from public.tournaments')).rows.length,1);});
+test('Anonymous visitor cannot create an event',async()=>{await assert.rejects(()=>as('anon',null,"insert into public.events(slug,name) values('bad','Bad event')"));});
+test('Anonymous visitor never reads private contact information',async()=>{await assert.rejects(()=>as('anon',null,'select * from public.participant_contacts'));});
+test('Public roster exposes approved gamer tags',async()=>{assert.equal((await as('anon',null,'select gamer_tag from public.participants')).rows[0].gamer_tag,'Nova');});
+test('Unknown account is not staff and cannot self-promote',async()=>{assert.equal((await as('authenticated',stranger,'select public.is_staff() as allowed')).rows[0].allowed,false);await assert.rejects(()=>db.query(`select public.assign_staff('${stranger}','organizer','${event}',null)`));});
+test('Referee is staff but cannot manage event or assign roles',async()=>{assert.equal((await as('authenticated',referee,'select public.is_staff() as allowed')).rows[0].allowed,true);assert.equal((await db.query(`select public.can_manage_event('${event}') as allowed`)).rows[0].allowed,false);await assert.rejects(()=>db.query(`select public.assign_staff('${referee}','organizer','${event}',null)`));});
+test('Referee cannot bypass the competition engine by writing scores',async()=>{await assert.rejects(()=>as('authenticated',referee,`insert into public.matches(tournament_id,round,bracket,position) values('${tournament}',1,'upper',1)`));});
+test('Organizer cannot edit an unrelated tournament',async()=>{const r=await as('authenticated',organizer,`update public.tournaments set name='Unauthorized' where id='${privateT}' returning id`);assert.equal(r.rows.length,0);});
+test('Organizer can edit assigned event and gets an audit record',async()=>{await as('authenticated',organizer,`update public.events set venue='ITSE' where id='${event}'`);const r=await db.query(`select * from public.audit_logs where entity='events' and action='UPDATE'`);assert.equal(r.rows.length,1);assert.equal(r.rows[0].actor_id,organizer);assert.equal(r.rows[0].current.venue,'ITSE');});
+test('Permission scope is immutable even for an authorized organizer',async()=>{await assert.rejects(()=>as('authenticated',organizer,`update public.tournaments set event_id='${hidden}' where id='${tournament}'`));});
+test('Cross-event registration rejected at database boundary',async()=>{await assert.rejects(()=>as('authenticated',admin,`insert into public.registrations(tournament_id,participant_id) values('${privateT}','${player}')`));});
+test('Role assignments are server-authorized and audited',async()=>{await as('authenticated',organizer,`select public.assign_staff('${stranger}','referee',null,'${tournament}')`);assert.equal((await db.query(`select * from public.tournament_memberships where user_id='${stranger}'`)).rows.length,1);assert.equal((await db.query(`select * from public.audit_logs where entity='tournament_memberships' and actor_id='${organizer}'`)).rows.length,1);});
+test('Audit history cannot be modified by staff',async()=>{await assert.rejects(()=>as('authenticated',organizer,"update public.audit_logs set action='HIDDEN'"));});
+test('Platform admin can create an event, normal organizer cannot',async()=>{await as('authenticated',admin,"insert into public.events(slug,name) values('new-event','New event')");await assert.rejects(()=>as('authenticated',organizer,"insert into public.events(slug,name) values('another-event','Another event')"));});
